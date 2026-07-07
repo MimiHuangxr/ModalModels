@@ -1,11 +1,20 @@
 module ModalSolver
 
+# Physics-aided normal-mode acoustic propagation model (MBNN).
+#
+# Optimization uses Julia's standard tooling: Optimisers.jl (the same Adam
+# engine Flux uses under the hood, via `Flux.setup`/`Flux.Adam`). Gradient
+# clipping uses `Optimisers.ClipNorm`, which — because the trainable parameters
+# are a single flat vector — is exactly the global-L2-norm clip used before.
+# To use Flux directly instead, replace `import Optimisers` with `import Flux`
+# and `Optimisers.` with `Flux.` throughout `_train`.
+
 using CSV
 using DataFrames
 using Random
 using Statistics
-using LinearAlgebra
 import ForwardDiff
+import Optimisers
 
 export ModeSolver, fit!, train_mbnn
 export predict_amp, predict_grid, learned_ssp, active_modes
@@ -59,23 +68,9 @@ function ModeSolver(env=nothing; D, f, nmodes::Int=6, nhidden::Int=6,
     D > 0 || error("D must be positive")
     f > 0 || error("f must be positive")
     branch = isnothing(ssp) ? :unknown_ssp : :known_ssp
-    return ModeSolver(
-        env,
-        Float64(D),
-        Float64(f),
-        nmodes,
-        nhidden,
-        ssp,
-        Float64(cmin),
-        Float64(cmax),
-        ngrid,
-        Float64(rref),
-        branch,
-        nothing,
-        1.0,
-        DataFrame(),
-        Dict{Symbol,Float64}(),
-    )
+    return ModeSolver(env, Float64(D), Float64(f), nmodes, nhidden, ssp,
+                      Float64(cmin), Float64(cmax), ngrid, Float64(rref),
+                      branch, nothing, 1.0, DataFrame(), Dict{Symbol,Float64}())
 end
 
 # -----------------------------------------------------------------------------
@@ -86,9 +81,9 @@ end
     load_measurements(file; range_col=:range_m, depth_col=:depth_m, amp_col=:amp,
                       split_col=:split, keep_split=true)
 
-Load measured acoustic amplitude data from a CSV file.
-Expected columns are receiver range, receiver depth, and amplitude.
-If a `split` column exists, it is preserved for train/validation splitting.
+Load measured acoustic amplitude data from a CSV file. Expected columns are
+receiver range, receiver depth, and amplitude. A `split` column, if present, is
+preserved for train/validation splitting.
 """
 function load_measurements(file; range_col=:range_m, depth_col=:depth_m, amp_col=:amp,
                            split_col=:split, keep_split::Bool=true)
@@ -96,17 +91,11 @@ function load_measurements(file; range_col=:range_m, depth_col=:depth_m, amp_col
     for col in (range_col, depth_col, amp_col)
         hasproperty(df, col) || error("CSV is missing required column: $col")
     end
-
-    out = (
-        range_m = Float64.(df[:, range_col]),
-        depth_m = Float64.(df[:, depth_col]),
-        amp = Float64.(df[:, amp_col]),
-    )
-
+    out = (range_m=Float64.(df[:, range_col]), depth_m=Float64.(df[:, depth_col]),
+           amp=Float64.(df[:, amp_col]))
     if keep_split && hasproperty(df, split_col)
-        return merge(out, (split = String.(df[:, split_col]),))
+        return merge(out, (split=String.(df[:, split_col]),))
     end
-
     return out
 end
 
@@ -125,31 +114,26 @@ end
 """
     split_train_val(data; val_fraction=0.0, seed=0)
 
-Return `(train, val)` named tuples.
-If `data.split` exists, rows labelled `train` go to training and rows labelled
-`val` or `validation` go to validation. Otherwise, a random validation split is
-used when `val_fraction > 0`; if not, validation equals training.
+Return `(train, val)` named tuples. If `data.split` exists, rows labelled
+`train`/`val`/`validation` are used accordingly. Otherwise a random validation
+split is used when `val_fraction > 0`; if not, validation equals training.
 """
 function split_train_val(data; val_fraction=0.0, seed=0)
     _check_data(data)
     n = length(data.amp)
-
     if hasproperty(data, :split)
         labels = lowercase.(String.(data.split))
-        train_idx = findall(x -> x == "train", labels)
+        train_idx = findall(==("train"), labels)
         val_idx = findall(x -> x == "val" || x == "validation", labels)
         isempty(train_idx) && error("split column exists, but no rows are labelled 'train'")
         isempty(val_idx) && (val_idx = train_idx)
         return _subset_data(data, train_idx), _subset_data(data, val_idx)
     end
-
     if val_fraction <= 0
         idx = collect(1:n)
         return _subset_data(data, idx), _subset_data(data, idx)
     end
-
-    rng = MersenneTwister(seed)
-    perm = randperm(rng, n)
+    perm = randperm(MersenneTwister(seed), n)
     nval = max(1, round(Int, val_fraction * n))
     val_idx = perm[1:nval]
     train_idx = perm[(nval + 1):end]
@@ -157,18 +141,13 @@ function split_train_val(data; val_fraction=0.0, seed=0)
     return _subset_data(data, train_idx), _subset_data(data, val_idx)
 end
 
-function _subset_data(data, idx)
-    return (
-        range_m = data.range_m[idx],
-        depth_m = data.depth_m[idx],
-        amp = data.amp[idx],
-    )
-end
+_subset_data(data, idx) =
+    (range_m=data.range_m[idx], depth_m=data.depth_m[idx], amp=data.amp[idx])
 
 function _check_data(data)
-    hasproperty(data, :range_m) || error("data must contain `range_m`")
-    hasproperty(data, :depth_m) || error("data must contain `depth_m`")
-    hasproperty(data, :amp) || error("data must contain `amp`")
+    for col in (:range_m, :depth_m, :amp)
+        hasproperty(data, col) || error("data must contain `$col`")
+    end
     length(data.range_m) == length(data.depth_m) == length(data.amp) ||
         error("data.range_m, data.depth_m, and data.amp must have the same length")
     all(data.range_m .> 0) || error("all ranges must be positive")
@@ -229,15 +208,11 @@ function _ssp_function(ssp)
     if ssp isa Function
         return z -> Float64(ssp(z))
     elseif ssp isa Tuple && length(ssp) == 2
-        zvec = Float64.(ssp[1])
-        cvec = Float64.(ssp[2])
-        return _linear_interp_function(zvec, cvec)
+        return _linear_interp_function(Float64.(ssp[1]), Float64.(ssp[2]))
     elseif hasproperty(ssp, :depth_m) && hasproperty(ssp, :c_ms)
-        zvec = Float64.(ssp.depth_m)
-        cvec = Float64.(ssp.c_ms)
-        return _linear_interp_function(zvec, cvec)
+        return _linear_interp_function(Float64.(ssp.depth_m), Float64.(ssp.c_ms))
     else
-        error("ssp must be either a function z -> c, a tuple (depth_m, c_ms), or a named tuple with depth_m and c_ms")
+        error("ssp must be a function z -> c, a tuple (depth_m, c_ms), or a named tuple with depth_m and c_ms")
     end
 end
 
@@ -247,12 +222,10 @@ function _linear_interp_function(zvec, cvec)
     p = sortperm(zvec)
     z = zvec[p]
     c = cvec[p]
-
     return function (x)
         x <= z[1] && return c[1]
         x >= z[end] && return c[end]
-        j = searchsortedlast(z, x)
-        j = clamp(j, 1, length(z) - 1)
+        j = clamp(searchsortedlast(z, x), 1, length(z) - 1)
         t = (x - z[j]) / (z[j + 1] - z[j])
         return (1 - t) * c[j] + t * c[j + 1]
     end
@@ -268,60 +241,46 @@ function _ssnn_c(pm::ModeSolver, W1, b1, W2, b2, z)
 end
 
 # -----------------------------------------------------------------------------
-# Parameter unpacking
+# Unpacking, sound-speed grid, and mode construction (unified over both branches)
 # -----------------------------------------------------------------------------
 
-function _unpack_known(pm::ModeSolver, theta)
-    n = pm.nmodes
-    A = theta[1:n] .+ im .* theta[(n + 1):(2 * n)]
-    B = theta[(2 * n + 1):(3 * n)] .+ im .* theta[(3 * n + 1):(4 * n)]
-    qkr = theta[(4 * n + 1):(5 * n)]
-
-    c_fn = _ssp_function(pm.ssp)
-    cgrid = [c_fn(z) for z in range(0.0, pm.D; length=pm.ngrid)]
-    kmax = 2π * pm.f / minimum(cgrid)
-    kr_lo = KR_LO_FRAC * kmax
-    kr_hi = KR_HI_FRAC * kmax
-    kr = kr_lo .+ (kr_hi - kr_lo) .* _sigmoid.(qkr)
-    return A, B, kr
+# Sound speed sampled on the depth grid: from the provided SSP (known branch),
+# or from the embedded SSNN parameters (unknown branch).
+function _cgrid(pm::ModeSolver, ssnn)
+    if pm.branch == :known_ssp
+        c = _ssp_function(pm.ssp)
+    else
+        W1, b1, W2, b2 = ssnn
+        c = z -> _ssnn_c(pm, W1, b1, W2, b2, z)
+    end
+    return [c(z) for z in range(0.0, pm.D; length=pm.ngrid)]
 end
 
-function _unpack_unknown(pm::ModeSolver, theta)
+# theta layout: [A_re; A_im; B_re; B_im; qkr] and, if unknown SSP, then
+# [W1; b1; W2; b2] appended. Returns (A, B, kr, ssnn) with ssnn=nothing if known.
+function _unpack(pm::ModeSolver, theta)
     n = pm.nmodes
-    nh = pm.nhidden
-    A = theta[1:n] .+ im .* theta[(n + 1):(2 * n)]
-    B = theta[(2 * n + 1):(3 * n)] .+ im .* theta[(3 * n + 1):(4 * n)]
-    qkr = theta[(4 * n + 1):(5 * n)]
-
-    kmax = 2π * pm.f / pm.cmin
-    kr_lo = KR_LO_FRAC * kmax
-    kr_hi = KR_HI_FRAC * kmax
-    kr = kr_lo .+ (kr_hi - kr_lo) .* _sigmoid.(qkr)
-
-    o = 5 * n
-    W1 = theta[(o + 1):(o + nh)]
-    b1 = theta[(o + nh + 1):(o + 2 * nh)]
-    W2 = theta[(o + 2 * nh + 1):(o + 3 * nh)]
-    b2 = theta[o + 3 * nh + 1]
-
-    return A, B, kr, W1, b1, W2, b2
+    A = theta[1:n] .+ im .* theta[(n + 1):(2n)]
+    B = theta[(2n + 1):(3n)] .+ im .* theta[(3n + 1):(4n)]
+    qkr = theta[(4n + 1):(5n)]
+    cmin_speed = pm.branch == :known_ssp ? minimum(_cgrid(pm, nothing)) : pm.cmin
+    kmax = 2π * pm.f / cmin_speed
+    kr = KR_LO_FRAC * kmax .+ (KR_HI_FRAC - KR_LO_FRAC) * kmax .* _sigmoid.(qkr)
+    ssnn = nothing
+    if pm.branch == :unknown_ssp
+        nh = pm.nhidden
+        o = 5n
+        ssnn = (theta[(o + 1):(o + nh)], theta[(o + nh + 1):(o + 2nh)],
+                theta[(o + 2nh + 1):(o + 3nh)], theta[o + 3nh + 1])
+    end
+    return A, B, kr, ssnn
 end
 
-# -----------------------------------------------------------------------------
-# Mode construction
-# -----------------------------------------------------------------------------
-
-function _build_known_modes(pm::ModeSolver, theta)
-    A, B, kr = _unpack_known(pm, theta)
-    c_fn = _ssp_function(pm.ssp)
+function _build_modes(pm::ModeSolver, A, B, kr, cgrid)
     ω = 2π * pm.f
     dz = pm.D / (pm.ngrid - 1)
-    zgrid = range(0.0, pm.D; length=pm.ngrid)
-    cgrid = [c_fn(z) for z in zgrid]
-
     T = eltype(kr)
     mode_profiles = Vector{Vector{Complex{T}}}(undef, pm.nmodes)
-
     for m in 1:pm.nmodes
         kz = @. sqrt(complex((ω / cgrid)^2 - kr[m]^2))
         kz_safe = kz .+ complex(1e-12)
@@ -329,203 +288,107 @@ function _build_known_modes(pm::ModeSolver, theta)
         mode_profiles[m] = @. A[m] * exp(im * phase) / sqrt(kz_safe) +
                               B[m] * exp(-im * phase) / sqrt(kz_safe)
     end
-
-    return mode_profiles, dz, kr
-end
-
-function _build_unknown_modes(pm::ModeSolver, theta)
-    A, B, kr, W1, b1, W2, b2 = _unpack_unknown(pm, theta)
-    ω = 2π * pm.f
-    dz = pm.D / (pm.ngrid - 1)
-    zgrid = range(0.0, pm.D; length=pm.ngrid)
-    cgrid = [_ssnn_c(pm, W1, b1, W2, b2, z) for z in zgrid]
-
-    T = eltype(kr)
-    mode_profiles = Vector{Vector{Complex{T}}}(undef, pm.nmodes)
-
-    for m in 1:pm.nmodes
-        kz = @. sqrt(complex((ω / cgrid)^2 - kr[m]^2))
-        kz_safe = kz .+ complex(1e-12)
-        phase = _cumtrapz(kz, dz)
-        mode_profiles[m] = @. A[m] * exp(im * phase) / sqrt(kz_safe) +
-                              B[m] * exp(-im * phase) / sqrt(kz_safe)
-    end
-
-    return mode_profiles, dz, kr, cgrid
+    return mode_profiles, dz
 end
 
 # -----------------------------------------------------------------------------
-# Loss functions
+# Loss (unified): individual components, then the weighted sum
 # -----------------------------------------------------------------------------
 
-function _known_loss(pm::ModeSolver, theta, data, idxs;
-                     λ_amp=1.0, λ_log=0.0, λ_surface=1e-4,
-                     α=1e-6, β=1e-6, eps_amp=1e-8)
-    A, B, kr = _unpack_known(pm, theta)
-    mode_profiles, dz, kr2 = _build_known_modes(pm, theta)
+function _components(pm::ModeSolver, theta, data, idxs)
+    A, B, kr, ssnn = _unpack(pm, theta)
+    cgrid = _cgrid(pm, ssnn)
+    mode_profiles, dz = _build_modes(pm, A, B, kr, cgrid)
+    T = eltype(theta)
 
-    L_amp = zero(eltype(theta))
-    L_log = zero(eltype(theta))
-
+    L_amp = zero(T)
+    L_log = zero(T)
     for ii in idxs
-        p = _field_from_profiles(pm, mode_profiles, kr2, dz, data.range_m[ii], data.depth_m[ii])
-        pred = _complex_abs_smooth(p)
-        truth = data.amp[ii]
-        L_amp += (pred - truth)^2
-        L_log += (log(pred + eps_amp) - log(truth + eps_amp))^2
-    end
-
-    L_amp /= length(idxs)
-    L_log /= length(idxs)
-
-    L_surface = zero(eltype(theta))
-    for m in 1:pm.nmodes
-        L_surface += real(A[m] + B[m])^2 + imag(A[m] + B[m])^2
-    end
-    L_surface /= pm.nmodes
-
-    return λ_amp * L_amp + λ_log * L_log +
-           λ_surface * L_surface + α * _complex_l1(A) + β * _complex_l1(B)
-end
-
-function _unknown_components(pm::ModeSolver, theta, data, idxs)
-    A, B, kr, W1, b1, W2, b2 = _unpack_unknown(pm, theta)
-    mode_profiles, dz, kr2, cgrid = _build_unknown_modes(pm, theta)
-
-    L_amp = zero(eltype(theta))
-    L_log = zero(eltype(theta))
-
-    for ii in idxs
-        p = _field_from_profiles(pm, mode_profiles, kr2, dz, data.range_m[ii], data.depth_m[ii])
-        pred = _complex_abs_smooth(p)
+        pred = _complex_abs_smooth(_field_from_profiles(pm, mode_profiles, kr, dz,
+                                                        data.range_m[ii], data.depth_m[ii]))
         truth = data.amp[ii]
         L_amp += (pred - truth)^2
         L_log += (log(pred + 1e-8) - log(truth + 1e-8))^2
     end
-
     L_amp /= length(idxs)
     L_log /= length(idxs)
 
-    L_surface = zero(eltype(theta))
+    L_surface = zero(T)
     for m in 1:pm.nmodes
-        L_surface += real(A[m] + B[m])^2 + imag(A[m] + B[m])^2
+        L_surface += abs2(A[m] + B[m])
     end
     L_surface /= pm.nmodes
 
-    L_smooth = zero(eltype(theta))
-    for i in 2:(length(cgrid) - 1)
-        L_smooth += (cgrid[i + 1] - 2 * cgrid[i] + cgrid[i - 1])^2
+    L_smooth = zero(T)
+    L_mono = zero(T)
+    if pm.branch == :unknown_ssp
+        for i in 2:(length(cgrid) - 1)
+            L_smooth += (cgrid[i + 1] - 2 * cgrid[i] + cgrid[i - 1])^2
+        end
+        L_smooth /= length(cgrid)
+        for i in 1:(length(cgrid) - 1)
+            dc = cgrid[i + 1] - cgrid[i]
+            L_mono += max(zero(dc), -dc)^2
+        end
+        L_mono /= length(cgrid)
     end
-    L_smooth /= length(cgrid)
 
-    L_mono = zero(eltype(theta))
-    for i in 1:(length(cgrid) - 1)
-        dc = cgrid[i + 1] - cgrid[i]
-        L_mono += max(zero(dc), -dc)^2
-    end
-    L_mono /= length(cgrid)
-
-    L_A = _complex_l1(A)
-    L_B = _complex_l1(B)
-
-    return L_amp, L_log, L_surface, L_smooth, L_mono, L_A, L_B
+    return (amp=L_amp, log=L_log, surface=L_surface, smooth=L_smooth, mono=L_mono,
+            A=_complex_l1(A), B=_complex_l1(B))
 end
 
-function _unknown_loss(pm::ModeSolver, theta, data, idxs; weights=pm.loss_weights)
-    L_amp, L_log, L_surface, L_smooth, L_mono, L_A, L_B =
-        _unknown_components(pm, theta, data, idxs)
-
-    return weights[:λ_amp] * L_amp +
-           weights[:λ_log] * L_log +
-           weights[:λ_surface] * L_surface +
-           weights[:λ_smooth] * L_smooth +
-           weights[:λ_mono] * L_mono +
-           weights[:α] * L_A +
-           weights[:β] * L_B
+function _loss(pm::ModeSolver, theta, data, idxs, w)
+    c = _components(pm, theta, data, idxs)
+    L = w[:λ_amp] * c.amp + w[:λ_log] * c.log + w[:λ_surface] * c.surface +
+        w[:α] * c.A + w[:β] * c.B
+    pm.branch == :unknown_ssp && (L += w[:λ_smooth] * c.smooth + w[:λ_mono] * c.mono)
+    return L
 end
 
 # -----------------------------------------------------------------------------
-# Initialization
+# Initialization (unified): physics-based kr guess; SSNN block if unknown SSP
 # -----------------------------------------------------------------------------
 
-function _init_known_theta(pm::ModeSolver, rng)
+function _init_theta(pm::ModeSolver, rng; c_init=(pm.cmin + pm.cmax) / 2)
     n = pm.nmodes
-    c_fn = _ssp_function(pm.ssp)
-    cgrid = [c_fn(z) for z in range(0.0, pm.D; length=pm.ngrid)]
-    c_ref = mean(cgrid)
+    if pm.branch == :known_ssp
+        cgrid = _cgrid(pm, nothing)
+        c_ref = mean(cgrid)
+        cmin_speed = minimum(cgrid)
+    else
+        c_ref = c_init
+        cmin_speed = pm.cmin
+    end
     kref = 2π * pm.f / c_ref
-    kmax = 2π * pm.f / minimum(cgrid)
+    kmax = 2π * pm.f / cmin_speed
     kr_lo = KR_LO_FRAC * kmax
     kr_hi = KR_HI_FRAC * kmax
+    qkr0 = [_logit(clamp((sqrt(max(kref^2 - ((m - 0.5) * π / pm.D)^2, 1e-8)) - kr_lo) /
+                         (kr_hi - kr_lo), 1e-3, 1 - 1e-3)) for m in 1:n]
 
-    qkr0 = Float64[]
-    for m in 1:n
-        kz_guess = (m - 0.5) * π / pm.D
-        kr_guess = sqrt(max(kref^2 - kz_guess^2, 1e-8))
-        u = clamp((kr_guess - kr_lo) / (kr_hi - kr_lo), 1e-3, 1 - 1e-3)
-        push!(qkr0, _logit(u))
+    theta = vcat(randn(rng, n), randn(rng, n), randn(rng, n), randn(rng, n), qkr0)
+    if pm.branch == :unknown_ssp
+        nh = pm.nhidden
+        u_init = clamp((c_init - pm.cmin) / (pm.cmax - pm.cmin), 1e-3, 1 - 1e-3)
+        theta = vcat(theta, 1.0 .* randn(rng, nh), 0.5 .* randn(rng, nh),
+                     0.05 .* randn(rng, nh), [_logit(u_init)])
     end
-
-    return vcat(
-        1.0 .* randn(rng, n),
-        1.0 .* randn(rng, n),
-        1.0 .* randn(rng, n),
-        1.0 .* randn(rng, n),
-        qkr0,
-    )
-end
-
-function _init_unknown_theta(pm::ModeSolver, rng; c_init=(pm.cmin + pm.cmax) / 2)
-    n = pm.nmodes
-    nh = pm.nhidden
-    kref = 2π * pm.f / c_init
-    kmax = 2π * pm.f / pm.cmin
-    kr_lo = KR_LO_FRAC * kmax
-    kr_hi = KR_HI_FRAC * kmax
-
-    qkr0 = Float64[]
-    for m in 1:n
-        kz_guess = (m - 0.5) * π / pm.D
-        kr_guess = sqrt(max(kref^2 - kz_guess^2, 1e-8))
-        u = clamp((kr_guess - kr_lo) / (kr_hi - kr_lo), 1e-3, 1 - 1e-3)
-        push!(qkr0, _logit(u))
-    end
-
-    u_init = clamp((c_init - pm.cmin) / (pm.cmax - pm.cmin), 1e-3, 1 - 1e-3)
-    W1_0 = 1.0 .* randn(rng, nh)
-    b1_0 = 0.5 .* randn(rng, nh)
-    W2_0 = 0.05 .* randn(rng, nh)
-    b2_0 = _logit(u_init)
-
-    return vcat(
-        1.0 .* randn(rng, n),
-        1.0 .* randn(rng, n),
-        1.0 .* randn(rng, n),
-        1.0 .* randn(rng, n),
-        qkr0,
-        W1_0,
-        b1_0,
-        W2_0,
-        [b2_0],
-    )
+    return theta
 end
 
 function _auto_balance_unknown!(pm::ModeSolver, theta, train_data, rng; sample_size=256)
     idxs = rand(rng, 1:length(train_data.amp), min(sample_size, length(train_data.amp)))
-    L_amp, L_log, L_surface, L_smooth, L_mono, L_A, L_B =
-        _unknown_components(pm, theta, train_data, idxs)
+    c = _components(pm, theta, train_data, idxs)
     safe(x) = Float64(abs(x)) + 1e-12
-
     pm.loss_weights = Dict{Symbol,Float64}(
-        :λ_amp => clamp(0.70 / safe(L_amp), 1e-6, 10.0),
-        :λ_log => clamp(0.30 / safe(L_log), 1e-6, 10.0),
-        :λ_surface => clamp(1e-3 / safe(L_surface), 1e-8, 1e-3),
-        :λ_smooth => clamp(1e-3 / safe(L_smooth), 1e-8, 5e-3),
-        :λ_mono => clamp(1e-3 / safe(L_mono), 1e-8, 5e-3),
-        :α => clamp(1e-3 / safe(L_A), 1e-8, 1e-4),
-        :β => clamp(1e-3 / safe(L_B), 1e-8, 1e-4),
+        :λ_amp => clamp(0.70 / safe(c.amp), 1e-6, 10.0),
+        :λ_log => clamp(0.30 / safe(c.log), 1e-6, 10.0),
+        :λ_surface => clamp(1e-3 / safe(c.surface), 1e-8, 1e-3),
+        :λ_smooth => clamp(1e-3 / safe(c.smooth), 1e-8, 5e-3),
+        :λ_mono => clamp(1e-3 / safe(c.mono), 1e-8, 5e-3),
+        :α => clamp(1e-3 / safe(c.A), 1e-8, 1e-4),
+        :β => clamp(1e-3 / safe(c.B), 1e-8, 1e-4),
     )
-
     return pm.loss_weights
 end
 
@@ -538,9 +401,9 @@ end
     fit!(pm, csvfile; kwargs...)
     fit!(pm, tx, rxs, data; kwargs...)
 
-Train the modal model on measured amplitudes.
-`tx` and `rxs` are accepted for compatibility, but this MBNN implementation uses
-the range/depth values inside `data`.
+Train the modal model on measured amplitudes. `tx` and `rxs` are accepted for
+API compatibility, but this MBNN implementation reads the range/depth values
+from `data`.
 
 Common keyword arguments:
 - `epochs`: training epochs per restart
@@ -552,71 +415,43 @@ Common keyword arguments:
 - `log_every`: print interval
 """
 function fit!(pm::ModeSolver, data; epochs=2000, batch_size=256, lr=nothing,
-              restarts=1, val_fraction=0.0, seed=1000, log_every=250,
+              restarts=10, val_fraction=0.0, seed=1000, log_every=250,
               verbose=true, auto_balance=true, kwargs...)
     _check_data(data)
-
     train_raw, val_raw = split_train_val(data; val_fraction=val_fraction, seed=seed)
     yscale = mean(train_raw.amp)
     yscale > 0 || error("mean training amplitude must be positive")
     pm.yscale = yscale
-
     train_data = (range_m=train_raw.range_m, depth_m=train_raw.depth_m, amp=train_raw.amp ./ yscale)
     val_data = (range_m=val_raw.range_m, depth_m=val_raw.depth_m, amp=val_raw.amp ./ yscale)
 
     if pm.branch == :known_ssp
-        return _fit_known_ssp!(pm, train_data, val_data;
-            epochs=epochs,
-            batch_size=batch_size,
-            lr=isnothing(lr) ? 3e-2 : lr,
-            restarts=restarts,
-            seed=seed,
-            log_every=log_every,
-            verbose=verbose,
-            kwargs...,
-        )
+        return _fit_known_ssp!(pm, train_data, val_data; epochs, batch_size,
+            lr=isnothing(lr) ? 3e-2 : lr, restarts, seed, log_every, verbose, kwargs...)
     else
-        return _fit_unknown_ssp!(pm, train_data, val_data;
-            epochs=epochs,
-            batch_size=batch_size,
-            lr=isnothing(lr) ? 4e-2 : lr,
-            restarts=restarts,
-            seed=seed,
-            log_every=log_every,
-            verbose=verbose,
-            auto_balance=auto_balance,
-            kwargs...,
-        )
+        return _fit_unknown_ssp!(pm, train_data, val_data; epochs, batch_size,
+            lr=isnothing(lr) ? 4e-2 : lr, restarts, seed, log_every, verbose, auto_balance, kwargs...)
     end
 end
 
-function fit!(pm::ModeSolver, csvfile::AbstractString; kwargs...)
-    data = load_measurements(csvfile)
-    return fit!(pm, data; kwargs...)
-end
+fit!(pm::ModeSolver, csvfile::AbstractString; kwargs...) =
+    fit!(pm, load_measurements(csvfile); kwargs...)
+fit!(pm::ModeSolver, tx, rxs, data; kwargs...) = fit!(pm, data; kwargs...)
+fit!(pm::ModeSolver, tx, rxs, csvfile::AbstractString; kwargs...) =
+    fit!(pm, load_measurements(csvfile); kwargs...)
 
-function fit!(pm::ModeSolver, tx, rxs, data; kwargs...)
-    return fit!(pm, data; kwargs...)
-end
-
-function fit!(pm::ModeSolver, tx, rxs, csvfile::AbstractString; kwargs...)
-    data = load_measurements(csvfile)
-    return fit!(pm, data; kwargs...)
-end
-
-function _adam_train(loss, theta0; epochs, lr, batch_loss, batch_size, ntrain,
-                     rng, log_every, verbose, val_loss)
+# Adam training via Optimisers.jl. ClipNorm(100) reproduces the previous
+# global-L2-norm gradient clip (theta is a single parameter leaf), and
+# Optimisers.Adam is the standard Adam update (β=(0.9,0.999), ϵ=1e-8).
+function _train(loss, theta0; epochs, lr, batch_loss, batch_size, ntrain,
+                rng, log_every, verbose, val_loss)
     theta = copy(theta0)
-    m = zeros(length(theta))
-    v = zeros(length(theta))
-    β1 = 0.9
-    β2 = 0.999
-    eps_adam = 1e-8
+    rule = Optimisers.OptimiserChain(Optimisers.ClipNorm(100.0), Optimisers.Adam(lr))
+    state = Optimisers.setup(rule, theta)
 
     best_theta = copy(theta)
     best_val = Inf
     best_epoch = 0
-
     epoch_hist = Int[]
     train_hist = Float64[]
     val_hist = Float64[]
@@ -624,18 +459,7 @@ function _adam_train(loss, theta0; epochs, lr, batch_loss, batch_size, ntrain,
     for epoch in 1:epochs
         idxs = rand(rng, 1:ntrain, min(batch_size, ntrain))
         g = ForwardDiff.gradient(t -> batch_loss(t, idxs), theta)
-
-        gnorm = norm(g)
-        if isfinite(gnorm) && gnorm > 100.0
-            g .*= 100.0 / gnorm
-        end
-
-        @. m = β1 * m + (1 - β1) * g
-        @. v = β2 * v + (1 - β2) * g^2
-
-        mh = m ./ (1 - β1^epoch)
-        vh = v ./ (1 - β2^epoch)
-        @. theta = theta - lr * mh / (sqrt(vh) + eps_adam)
+        state, theta = Optimisers.update!(state, theta, g)
 
         if epoch == 1 || epoch % log_every == 0 || epoch == epochs
             tl = Float64(loss(theta))
@@ -643,143 +467,85 @@ function _adam_train(loss, theta0; epochs, lr, batch_loss, batch_size, ntrain,
             push!(epoch_hist, epoch)
             push!(train_hist, tl)
             push!(val_hist, vl)
-
             if vl < best_val
                 best_val = vl
                 best_theta = copy(theta)
                 best_epoch = epoch
             end
-
             verbose && println("epoch $epoch | train=$(round(tl; sigdigits=5)) | val=$(round(vl; sigdigits=5))")
         end
     end
-
     return best_theta, best_val, best_epoch, epoch_hist, train_hist, val_hist
 end
 
-function _fit_known_ssp!(pm::ModeSolver, train_data, val_data;
-                         epochs, batch_size, lr, restarts, seed, log_every, verbose,
+function _fit_known_ssp!(pm::ModeSolver, train_data, val_data; epochs, batch_size, lr,
+                         restarts, seed, log_every, verbose,
                          λ_amp=1.0, λ_log=0.0, λ_surface=1e-4, α=1e-6, β=1e-6)
-    pm.loss_weights = Dict{Symbol,Float64}(
-        :λ_amp => λ_amp,
-        :λ_log => λ_log,
-        :λ_surface => λ_surface,
-        :α => α,
-        :β => β,
-    )
-
-    global_best_theta = nothing
-    global_best_val = Inf
-    global_best_restart = 0
-    global_best_epoch = 0
-    best_history = DataFrame()
+    weights = Dict{Symbol,Float64}(:λ_amp => λ_amp, :λ_log => λ_log,
+                                   :λ_surface => λ_surface, :α => α, :β => β)
+    pm.loss_weights = weights
+    best = (theta=nothing, val=Inf, restart=0, epoch=0, hist=DataFrame())
 
     for restart in 1:restarts
         rng = MersenneTwister(seed + restart)
-        theta0 = _init_known_theta(pm, rng)
+        theta0 = _init_theta(pm, rng)
         verbose && println("\nKnown-SSP restart $restart / $restarts")
 
-        full_train = theta -> _known_loss(pm, theta, train_data, eachindex(train_data.amp);
-            λ_amp=λ_amp, λ_log=λ_log, λ_surface=λ_surface, α=α, β=β)
-        full_val = theta -> _known_loss(pm, theta, val_data, eachindex(val_data.amp);
-            λ_amp=λ_amp, λ_log=λ_log, λ_surface=λ_surface, α=α, β=β)
-        batch_loss = (theta, idxs) -> _known_loss(pm, theta, train_data, idxs;
-            λ_amp=λ_amp, λ_log=λ_log, λ_surface=λ_surface, α=α, β=β)
+        train_loss = theta -> _loss(pm, theta, train_data, eachindex(train_data.amp), weights)
+        val_loss = theta -> _loss(pm, theta, val_data, eachindex(val_data.amp), weights)
+        batch_loss = (theta, idxs) -> _loss(pm, theta, train_data, idxs, weights)
 
-        theta, val, best_epoch, eh, th, vh = _adam_train(
-            full_train,
-            theta0;
-            epochs=epochs,
-            lr=lr,
-            batch_loss=batch_loss,
-            batch_size=batch_size,
-            ntrain=length(train_data.amp),
-            rng=rng,
-            log_every=log_every,
-            verbose=verbose,
-            val_loss=full_val,
-        )
-
-        if val < global_best_val
-            global_best_theta = copy(theta)
-            global_best_val = val
-            global_best_restart = restart
-            global_best_epoch = best_epoch
-            best_history = DataFrame(epoch=eh, train_loss=th, val_loss=vh)
+        theta, val, be, eh, th, vh = _train(train_loss, theta0; epochs, lr, batch_loss,
+            batch_size, ntrain=length(train_data.amp), rng, log_every, verbose, val_loss)
+        if val < best.val
+            best = (theta=copy(theta), val=val, restart=restart, epoch=be,
+                    hist=DataFrame(epoch=eh, train_loss=th, val_loss=vh))
         end
     end
 
-    pm.theta = global_best_theta
-    pm.history = best_history
-    verbose && println("\nBest known-SSP run: restart=$global_best_restart epoch=$global_best_epoch val=$global_best_val")
+    pm.theta = best.theta
+    pm.history = best.hist
+    verbose && println("\nBest known-SSP run: restart=$(best.restart) epoch=$(best.epoch) val=$(best.val)")
     return pm
 end
 
-function _fit_unknown_ssp!(pm::ModeSolver, train_data, val_data;
-                           epochs, batch_size, lr, restarts, seed, log_every, verbose,
-                           auto_balance=true)
-    global_best_theta = nothing
-    global_best_val = Inf
-    global_best_restart = 0
-    global_best_epoch = 0
-    best_history = DataFrame()
-    best_weights = Dict{Symbol,Float64}()
+function _fit_unknown_ssp!(pm::ModeSolver, train_data, val_data; epochs, batch_size, lr,
+                           restarts, seed, log_every, verbose, auto_balance=true)
+    best = (theta=nothing, val=Inf, restart=0, epoch=0, hist=DataFrame(), weights=Dict{Symbol,Float64}())
 
     for restart in 1:restarts
         rng = MersenneTwister(seed + restart)
-        theta0 = _init_unknown_theta(pm, rng)
+        theta0 = _init_theta(pm, rng)
 
         if auto_balance || isempty(pm.loss_weights)
             _auto_balance_unknown!(pm, theta0, train_data, rng)
         else
-            defaults = Dict{Symbol,Float64}(
-                :λ_amp => 0.70,
-                :λ_log => 0.30,
-                :λ_surface => 1e-4,
-                :λ_smooth => 8e-4,
-                :λ_mono => 8e-4,
-                :α => 1e-6,
-                :β => 1e-6,
-            )
+            defaults = Dict{Symbol,Float64}(:λ_amp => 0.70, :λ_log => 0.30,
+                :λ_surface => 1e-4, :λ_smooth => 8e-4, :λ_mono => 8e-4, :α => 1e-6, :β => 1e-6)
             merge!(defaults, pm.loss_weights)
             pm.loss_weights = defaults
         end
+        weights = pm.loss_weights
 
         verbose && println("\nUnknown-SSP restart $restart / $restarts")
-        verbose && println("loss weights = ", pm.loss_weights)
+        verbose && println("loss weights = ", weights)
 
-        full_train = theta -> _unknown_loss(pm, theta, train_data, eachindex(train_data.amp))
-        full_val = theta -> _unknown_loss(pm, theta, val_data, eachindex(val_data.amp))
-        batch_loss = (theta, idxs) -> _unknown_loss(pm, theta, train_data, idxs)
+        train_loss = theta -> _loss(pm, theta, train_data, eachindex(train_data.amp), weights)
+        val_loss = theta -> _loss(pm, theta, val_data, eachindex(val_data.amp), weights)
+        batch_loss = (theta, idxs) -> _loss(pm, theta, train_data, idxs, weights)
 
-        theta, val, best_epoch, eh, th, vh = _adam_train(
-            full_train,
-            theta0;
-            epochs=epochs,
-            lr=lr,
-            batch_loss=batch_loss,
-            batch_size=batch_size,
-            ntrain=length(train_data.amp),
-            rng=rng,
-            log_every=log_every,
-            verbose=verbose,
-            val_loss=full_val,
-        )
-
-        if val < global_best_val
-            global_best_theta = copy(theta)
-            global_best_val = val
-            global_best_restart = restart
-            global_best_epoch = best_epoch
-            best_history = DataFrame(epoch=eh, train_loss=th, val_loss=vh)
-            best_weights = copy(pm.loss_weights)
+        theta, val, be, eh, th, vh = _train(train_loss, theta0; epochs, lr, batch_loss,
+            batch_size, ntrain=length(train_data.amp), rng, log_every, verbose, val_loss)
+        if val < best.val
+            best = (theta=copy(theta), val=val, restart=restart, epoch=be,
+                    hist=DataFrame(epoch=eh, train_loss=th, val_loss=vh), weights=copy(weights))
         end
     end
 
-    pm.theta = global_best_theta
-    pm.history = best_history
-    pm.loss_weights = best_weights
-    verbose && println("\nBest unknown-SSP run: restart=$global_best_restart epoch=$global_best_epoch val=$global_best_val")
+    pm.theta = best.theta
+    pm.history = best.hist
+    pm.loss_weights = best.weights
+    verbose && println("\nBest unknown-SSP run: restart=$(best.restart) epoch=$(best.epoch) val=$(best.val)")
     return pm
 end
 
@@ -789,22 +555,9 @@ end
 Convenience wrapper matching the README style. Returns a fitted `ModeSolver`.
 """
 function train_mbnn(range_m, depth_m, amp; env=nothing, D, f, nmodes::Int=6, nhidden::Int=6,
-                    ssp=nothing, cmin=1445.0, cmax=1462.0, ngrid::Int=200,
-                    rref=675.0, kwargs...)
-    pm = ModeSolver(
-        env;
-        D=D,
-        f=f,
-        nmodes=nmodes,
-        nhidden=nhidden,
-        ssp=ssp,
-        cmin=cmin,
-        cmax=cmax,
-        ngrid=ngrid,
-        rref=rref,
-    )
-    data = (range_m=Float64.(range_m), depth_m=Float64.(depth_m), amp=Float64.(amp))
-    fit!(pm, data; kwargs...)
+                    ssp=nothing, cmin=1445.0, cmax=1462.0, ngrid::Int=200, rref=675.0, kwargs...)
+    pm = ModeSolver(env; D, f, nmodes, nhidden, ssp, cmin, cmax, ngrid, rref)
+    fit!(pm, (range_m=Float64.(range_m), depth_m=Float64.(depth_m), amp=Float64.(amp)); kwargs...)
     return pm
 end
 
@@ -827,17 +580,11 @@ function predict_amp(pm::ModeSolver, ranges, depths)
     rs = Float64.(collect(ranges))
     zs = Float64.(collect(depths))
     length(rs) == length(zs) || error("ranges and depths must have the same length")
-
-    if pm.branch == :known_ssp
-        mode_profiles, dz, kr = _build_known_modes(pm, pm.theta)
-    else
-        mode_profiles, dz, kr, _ = _build_unknown_modes(pm, pm.theta)
-    end
-
+    A, B, kr, ssnn = _unpack(pm, pm.theta)
+    mode_profiles, dz = _build_modes(pm, A, B, kr, _cgrid(pm, ssnn))
     out = Vector{Float64}(undef, length(rs))
     for i in eachindex(rs)
-        p = _field_from_profiles(pm, mode_profiles, kr, dz, rs[i], zs[i])
-        out[i] = Float64(_complex_abs_smooth(p)) * pm.yscale
+        out[i] = Float64(_complex_abs_smooth(_field_from_profiles(pm, mode_profiles, kr, dz, rs[i], zs[i]))) * pm.yscale
     end
     return out
 end
@@ -845,20 +592,15 @@ end
 """
     predict_grid(pm, ranges, depths)
 
-Predict a full range-depth amplitude grid.
-Rows correspond to `depths`; columns correspond to `ranges`.
+Predict a full range-depth amplitude grid. Rows correspond to `depths`; columns
+correspond to `ranges`.
 """
 function predict_grid(pm::ModeSolver, ranges, depths)
     _require_fitted(pm)
     rs = Float64.(collect(ranges))
     zs = Float64.(collect(depths))
-
-    if pm.branch == :known_ssp
-        mode_profiles, dz, kr = _build_known_modes(pm, pm.theta)
-    else
-        mode_profiles, dz, kr, _ = _build_unknown_modes(pm, pm.theta)
-    end
-
+    A, B, kr, ssnn = _unpack(pm, pm.theta)
+    mode_profiles, dz = _build_modes(pm, A, B, kr, _cgrid(pm, ssnn))
     out = Matrix{Float64}(undef, length(zs), length(rs))
     for (iz, z) in enumerate(zs)
         mode_vals = [_interp_depth(mode_profiles[m], dz, pm.D, z) for m in eachindex(kr)]
@@ -876,16 +618,14 @@ end
 """
     learned_ssp(pm)
 
-Return a function `c(z)` for the learned SSP if SSP was unknown.
-If SSP was known, return the provided SSP interpolation function.
+Return a function `c(z)` for the learned SSP if SSP was unknown. If SSP was
+known, return the provided SSP interpolation function.
 """
 function learned_ssp(pm::ModeSolver)
-    if pm.branch == :known_ssp
-        return _ssp_function(pm.ssp)
-    end
-
+    pm.branch == :known_ssp && return _ssp_function(pm.ssp)
     _require_fitted(pm)
-    _, _, _, W1, b1, W2, b2 = _unpack_unknown(pm, pm.theta)
+    _, _, _, ssnn = _unpack(pm, pm.theta)
+    W1, b1, W2, b2 = ssnn
     return z -> Float64(_ssnn_c(pm, W1, b1, W2, b2, z))
 end
 
@@ -896,21 +636,13 @@ Return learned modal parameters ranked by `|A| + |B|`.
 """
 function active_modes(pm::ModeSolver)
     _require_fitted(pm)
-
-    if pm.branch == :known_ssp
-        A, B, kr = _unpack_known(pm, pm.theta)
-    else
-        A, B, kr, _, _, _, _ = _unpack_unknown(pm, pm.theta)
-    end
-
+    A, B, kr, _ = _unpack(pm, pm.theta)
     df = DataFrame(
-        mode = collect(1:pm.nmodes),
-        amplitude = Float64.([_complex_abs_smooth(A[i]) + _complex_abs_smooth(B[i]) for i in 1:pm.nmodes]),
-        kr = Float64.(kr),
-        A_re = Float64.(real.(A)),
-        A_im = Float64.(imag.(A)),
-        B_re = Float64.(real.(B)),
-        B_im = Float64.(imag.(B)),
+        mode=collect(1:pm.nmodes),
+        amplitude=Float64.([_complex_abs_smooth(A[i]) + _complex_abs_smooth(B[i]) for i in 1:pm.nmodes]),
+        kr=Float64.(kr),
+        A_re=Float64.(real.(A)), A_im=Float64.(imag.(A)),
+        B_re=Float64.(real.(B)), B_im=Float64.(imag.(B)),
     )
     sort!(df, :amplitude, rev=true)
     return df
