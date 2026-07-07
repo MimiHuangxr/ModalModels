@@ -13,7 +13,7 @@ Ocean Acoustic Propagation Modeling"*, International Congress of Acoustics, 2022
 
 ```julia
 julia> ]
-pkg> add CSV DataFrames Plots ForwardDiff
+pkg> add CSV DataFrames Plots ForwardDiff Optimisers
 ```
 
 Then place `ModalSolver.jl` in your working folder (proper package
