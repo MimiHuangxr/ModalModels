@@ -3,7 +3,7 @@ using Statistics, Plots, CSV, DataFrames
 
 ssp = load_ssp("true_ssnn_ssp.csv")
 pm  = ModeSolver(D=25.0, f=500.0, ssp=ssp)
-fit!(pm, "ssnn_profiles_1224.csv")
+fit!(pm, "ssnn_profiles_1224.csv"; restarts=10)
 
 # --- field heatmap (shows in the Julia Plots pane, and saves a PNG) ---
 ranges = 550.0:0.5:800.0
