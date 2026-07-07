@@ -19,7 +19,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          julia -e 'using Pkg; Pkg.add(["CSV", "DataFrames", "Plots", "ForwardDiff"])'
+          julia -e 'using Pkg; Pkg.add(["CSV", "DataFrames", "Plots", "ForwardDiff", "Optimisers"])'
 
       - name: Run baseline regression tests
         run: julia test/runtests.jl
