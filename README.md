@@ -84,7 +84,7 @@ active_modes(res)    # learnt modes ranked by |A|+|B|, with wavenumbers kr
 ```
 
 Complete worked examples reproducing the simulation studies from the paper are
-in the [`examples/`](examples/) folder.
+in the [`test/`](test/) folder.
 
 ## Notes
 
